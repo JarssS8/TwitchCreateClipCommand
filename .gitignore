@@ -1,0 +1,22 @@
+# Environment variables
+.env
+
+# OAuth tokens
+oauth_tokens.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
