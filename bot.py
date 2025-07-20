@@ -52,6 +52,11 @@ async def send_clip_to_discord(clip_url, channel_name, clip_data=None):
                     "name": "🔗 Link del Clip",
                     "value": f"[Ver Clip]({clip_url})",
                     "inline": True
+                },
+                {
+                    "name": "✏️ Editar Clip",
+                    "value": f"[Editar]({clip_url}/edit)",
+                    "inline": True
                 }
             ]
             
@@ -167,7 +172,7 @@ def extract_username_from_message(message):
     except:
         return None
 
-async def create_clip(creator_username=None):
+async def create_clip(creator_username=None, clip_name=None):
     try:
         # Prepare the API request
         url = f"https://api.twitch.tv/helix/clips?broadcaster_id={BROADCASTER_ID}&duration=60"
@@ -205,7 +210,8 @@ async def create_clip(creator_username=None):
                         elif creator_username:
                             # Si no hay clip_details, crear un diccionario básico
                             clip_details = {'creator_name': creator_username}
-                        
+                        if clip_name:
+                            clip_details['title'] = clip_name
                         # Enviar clip a Discord con información detallada
                         await send_clip_to_discord(clip_url, CHANNEL, clip_details)
                         
@@ -233,15 +239,17 @@ async def bot_loop():
             sock.send("PONG :tmi.twitch.tv\r\n".encode('utf-8'))        
         elif '!clip' in resp:
             print("Comando !clip recibido", flush=True)
-            
+            clip_name = resp.split('!clip')[1].strip()
             # Extraer el nombre de usuario que ejecutó el comando
             creator_username = extract_username_from_message(resp)
             if creator_username:
                 print(f"👤 Comando ejecutado por: {creator_username}", flush=True)
             
             try:
-                clip_url = await create_clip(creator_username)
-                send_message(sock, f"📸 Clip creado: {clip_url}")
+                clip_url = await create_clip(creator_username, clip_name)
+                if not clip_name:
+                    clip_name = "Clip creado"
+                send_message(sock, f"📸 {clip_name}: {clip_url}")
             except Exception as e:
                 print(f"Error al crear clip: {e}", flush=True)
                 send_message(sock, "❌ Error al crear el clip. Inténtalo más tarde.")
