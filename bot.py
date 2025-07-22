@@ -1,258 +1,287 @@
-import os
 import socket
-import asyncio
-import aiohttp
-import json
+import requests
+import threading
+import time
+import logging
+import os
+import sys
 from datetime import datetime
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+REQUIRED_ENV_VARS = ['BOT_USERNAME', 'OAUTH_TOKEN', 'CHANNEL_NAME', 'CLIENT_ID', 'ACCESS_TOKEN', 'CLIP_COOLDOWN_SECONDS', 'RECONNECT_DELAY_SECONDS', 'DISCORD_WEBHOOK_URL']
+for var in REQUIRED_ENV_VARS:
+    if not os.getenv(var):
+        logging.critical(f"Error: La variable de entorno '{var}' no está configurada. Por favor, añádela a tu archivo .env.")
+        sys.exit(1)
+
 HOST = 'irc.chat.twitch.tv'
 PORT = 6667
-TOKEN = os.getenv('TWITCH_OAUTH_TOKEN')
-CHANNEL = os.getenv('TWITCH_CHANNEL')
-CLIENT_ID = os.getenv('TWITCH_CLIENT_ID')
-BROADCASTER_ID = os.getenv('TWITCH_BROADCASTER_ID')  # Añadir el broadcaster ID
+NICK = os.getenv('BOT_USERNAME')
+TOKEN = os.getenv('OAUTH_TOKEN')
+CHANNEL = f"#{os.getenv('CHANNEL_NAME')}"
+CLIENT_ID = os.getenv('CLIENT_ID')
+ACCESS_TOKEN = os.getenv('ACCESS_TOKEN')
+
+CLIP_COOLDOWN_SECONDS = int(os.getenv('CLIP_COOLDOWN_SECONDS', '30'))
+RECONNECT_DELAY_SECONDS = int(os.getenv('RECONNECT_DELAY_SECONDS', '5'))
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 
-def send_message(sock, message):
-    sock.send(f'PRIVMSG #{CHANNEL} :{message}\r\n'.encode('utf-8'))
+class TwitchBot:
+    def __init__(self):
+        self.sock: Optional[socket.socket] = None
+        self.last_clip_time = 0
+        self.cooldown = CLIP_COOLDOWN_SECONDS
+        self.channel = CHANNEL.lower()
+        self.connected = False
 
-async def send_clip_to_discord(clip_url, channel_name, clip_data=None):
-    """Envía el clip al webhook de Discord"""
-    try:
-        # Información básica del embed
-        embed = {
-            "title": "🎬 Nuevo Clip Creado!",
-            "description": f"Se ha creado un nuevo clip en el canal **{channel_name}**",
-            "url": clip_url,
-            "color": 0x9146FF,  # Color morado de Twitch
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
-        # Si tenemos datos del clip, agregar más información
+    def _connect_irc(self):
+        try:
+            self.sock = socket.socket()
+            self.sock.connect((HOST, PORT))
+            self.sock.send(f"PASS {TOKEN}\r\n".encode('utf-8'))
+            self.sock.send(f"NICK {NICK}\r\n".encode('utf-8'))
+            self.sock.send(f"JOIN {CHANNEL}\r\n".encode('utf-8'))
+            self.connected = True
+            logging.info(f"Conectado a {CHANNEL}")
+            return True
+        except socket.error as e:
+            logging.error(f"Error al conectar al IRC: {e}")
+            self.connected = False
+            return False
+
+    def connect(self):
+        while not self.connected:
+            if not self._connect_irc():
+                logging.info(f"Reintentando conexión en {RECONNECT_DELAY_SECONDS} segundos...")
+                time.sleep(RECONNECT_DELAY_SECONDS)
+
+    def listen(self):
+        while True:
+            if not self.connected:
+                self.connect()
+
+            try:
+                resp = self.sock.recv(2048).decode('utf-8')
+
+                if resp.startswith('PING'):
+                    self.sock.send("PONG :tmi.twitch.tv\r\n".encode('utf-8'))
+                elif 'PRIVMSG' in resp:
+                    user_info, message_content = resp.split('PRIVMSG', 1)[1].split(':', 1)
+                    user = resp.split('!', 1)[0][1:].strip()
+                    message = message_content.strip()
+                    logging.info(f"{user}: {message}")
+
+                    if message.lower().startswith('!clip'):
+                        self._handle_clip_command(user, message) # Pasamos el mensaje completo
+
+            except socket.error as e:
+                logging.error(f"Error de socket, la conexión puede haberse perdido: {e}")
+                self.connected = False
+                self.sock.close()
+            except Exception as e:
+                logging.error(f"Error inesperado en el bucle de escucha: {e}")
+
+    def _handle_clip_command(self, user: str, full_message: str):
+        current_time = time.time()
+        time_since_last_clip = current_time - self.last_clip_time
+
+        if time_since_last_clip >= self.cooldown:
+            # Extraer el título del mensaje para Discord
+            command_prefix = "!clip"
+            if len(full_message) > len(command_prefix) and full_message.lower().startswith(command_prefix):
+                custom_embed_title = full_message[len(command_prefix):].strip()
+            else:
+                custom_embed_title = "" # Sin título personalizado
+
+            logging.info(f"Comando !clip recibido de {user}. Título solicitado para Discord: '{custom_embed_title}'. Iniciando creación de clip...")
+            threading.Thread(target=self._create_clip_and_respond, args=(user, custom_embed_title)).start()
+        else:
+            remaining_time = int(self.cooldown - time_since_last_clip)
+            cooldown_message = f"@{user}, el comando !clip está en enfriamiento. Por favor, espera {remaining_time} segundos."
+            self.send_message(cooldown_message)
+            logging.info(cooldown_message)
+
+    def _create_clip_and_respond(self, user: str, custom_embed_title: str):
+        clip_data = self._create_clip()
         if clip_data:
-            # Título del clip si está disponible
-            if clip_data.get('title'):
-                embed["title"] = f"🎬 {clip_data['title']}"
-            
-            # Descripción más detallada
-            embed["description"] = f"Nuevo clip creado en **{channel_name}**"
-            
-            # Miniatura del clip
-            if clip_data.get('thumbnail_url'):
-                embed["thumbnail"] = {
-                    "url": clip_data['thumbnail_url']
-                }
-            
-            # Campos con información adicional
-            fields = [
+            clip_id = clip_data.get('id')
+            clip_url = clip_data.get('url')
+            broadcaster_name = clip_data.get('broadcaster_name', CHANNEL.replace('#', '')) # Obtener el nombre del broadcaster
+            current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logging.info(f"Clip creado: ID={clip_id}, URL={clip_url}, Broadcaster={broadcaster_name}, Usuario={user}")
+            user = user.replace('#', '') 
+            final_embed_title = custom_embed_title if custom_embed_title else f"Nuevo clip del canal {broadcaster_name}"
+            self.send_message(f"@{user}, ¡clip creado! [{final_embed_title}] {clip_url}")
+
+            # Obtener el avatar del usuario que envió el comando
+            user_avatar = self._get_user_avatar(user)
+
+            self._send_discord_clip_notification(
+                user=user,
+                clip_url=clip_url,
+                clip_id=clip_id,
+                timestamp=current_datetime,
+                embed_title=final_embed_title,
+                broadcaster_name=broadcaster_name,
+                user_avatar=user_avatar
+            )
+            self.last_clip_time = time.time()
+        else:
+            self.send_message(f"@{user}, no se pudo crear el clip. Revisa los logs para más detalles.")
+
+    def _create_clip(self) -> Optional[dict]:
+        headers = {
+            'Client-ID': CLIENT_ID,
+            'Authorization': f'Bearer {ACCESS_TOKEN}',
+        }
+        try:
+            user_info_res = requests.get('https://api.twitch.tv/helix/users', headers=headers, timeout=5)
+            user_info_res.raise_for_status()
+            user_data = user_info_res.json().get('data')
+
+            if not user_data:
+                logging.error(f"La información del usuario no está presente en la respuesta de la API. Respuesta: {user_info_res.json()}")
+                return None
+
+            broadcaster_id = user_data[0]['id']
+            broadcaster_name = user_data[0]['display_name']
+            logging.info(f"ID del Broadcaster: {broadcaster_id}, Nombre: {broadcaster_name}")
+
+            clip_res = requests.post(f'https://api.twitch.tv/helix/clips?broadcaster_id={broadcaster_id}', headers=headers, timeout=5)
+            clip_res.raise_for_status()
+
+            clip_data = clip_res.json().get('data')
+
+            if clip_data and clip_data[0] and 'id' in clip_data[0]:
+                clip_id = clip_data[0]['id']
+                clip_url = f"https://clips.twitch.tv/{clip_id}"
+                logging.info(f"Clip creado con éxito. ID: {clip_id}, URL: {clip_url}")
+                return {'id': clip_id, 'url': clip_url, 'broadcaster_name': broadcaster_name}
+            else:
+                logging.error(f"El ID del clip no se encontró en la respuesta de la API. Respuesta: {clip_res.json()}")
+                return None
+
+        except requests.exceptions.Timeout:
+            logging.error("La solicitud a la API de Twitch excedió el tiempo de espera.")
+            return None
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code
+            error_message = e.response.text
+            logging.error(f"Error HTTP durante la creación del clip: {status_code} - {error_message}")
+            if status_code == 401:
+                logging.error("Token de acceso o Client-ID inválido/expirado. ¡Asegúrate de que sean correctos!")
+            elif status_code == 400 and "broadcaster is not live" in error_message.lower():
+                logging.error("No se pudo crear el clip: El canal no está en vivo.")
+            return None
+        except requests.RequestException as e:
+            logging.error(f"Error de solicitud general al interactuar con la API de Twitch: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Error inesperado al crear el clip: {e}")
+            return None
+
+    def _send_discord_clip_notification(self, user: str, clip_url: str, clip_id: str, timestamp: str, embed_title: str, broadcaster_name: str, user_avatar: str):
+        edit_url = f"https://dashboard.twitch.tv/content/video/clips?filters[query]={clip_id}&sort=created"
+
+        embed = {
+            "title": f"🎬 {embed_title}",  # Icono de cámara para el título
+            "description": f"📹 ¡Un clip acaba de ser creado en el canal **{broadcaster_name}**!\n\n🎯 **ID del Clip:** `{clip_id}`",
+            "color": 0x9146FF,
+            "fields": [
                 {
-                    "name": "🔗 Link del Clip",
-                    "value": f"[Ver Clip]({clip_url})",
+                    "name": "👤 Creador del clip",
+                    "value": f"**{user}**",
                     "inline": True
                 },
                 {
-                    "name": "✏️ Editar Clip",
-                    "value": f"[Editar]({clip_url}/edit)",
+                    "name": "🕒 Fecha y Hora",
+                    "value": f"```{timestamp}```",
                     "inline": True
-                }
-            ]
-            
-            # Duración del clip
-            if clip_data.get('duration'):
-                fields.append({
-                    "name": "⏱️ Duración",
-                    "value": f"{clip_data['duration']} segundos",
-                    "inline": True
-                })
-            
-            # Número de vistas (será 0 al principio)
-            if 'view_count' in clip_data:
-                fields.append({
-                    "name": "👀 Vistas",
-                    "value": str(clip_data['view_count']),
-                    "inline": True
-                })
-            
-            # Creador del clip
-            if clip_data.get('creator_name'):
-                fields.append({
-                    "name": "👤 Creado por",
-                    "value": clip_data['creator_name'],
-                    "inline": True
-                })
-            
-            # Fecha de creación
-            if clip_data.get('created_at'):
-                created_time = datetime.fromisoformat(clip_data['created_at'].replace('Z', '+00:00'))
-                fields.append({
-                    "name": "📅 Creado",
-                    "value": created_time.strftime("%d/%m/%Y %H:%M UTC"),
-                    "inline": True
-                })
-            
-            # ID del clip para referencia
-            if clip_data.get('id'):
-                fields.append({
-                    "name": "🆔 ID del Clip",
-                    "value": f"`{clip_data['id']}`",
-                    "inline": True
-                })
-            
-            embed["fields"] = fields
-        else:
-            # Fallback si no hay datos adicionales
-            embed["fields"] = [
+                },
                 {
-                    "name": "🔗 Link del Clip",
-                    "value": f"[Ver Clip]({clip_url})",
+                    "name": "🎮 Canal",
+                    "value": f"**{broadcaster_name}**",
+                    "inline": True
+                },
+                {
+                    "name": "▶️ Ver Clip",
+                    "value": f"[🔗 Reproducir en Twitch]({clip_url})",
+                    "inline": False
+                },
+                {
+                    "name": "✏️ Editar Clip",
+                    "value": f"({clip_url}/edit)",
                     "inline": False
                 }
-            ]
-        
-        # Footer con información del bot
-        embed["footer"] = {
-            "text": "Lore Clipper Bot • Twitch Clips",
-            "icon_url": "https://static-cdn.jtvnw.net/jtv_user_pictures/8a6381c7-d0c0-4576-b179-38bd5ce1d6af-profile_image-70x70.png"
+            ],
+            "thumbnail": {
+                "url": user_avatar  # Avatar del usuario que envió el comando
+            },
+            "footer": {
+                "text": "🧡 PukeClips",
+                "icon_url": "https://www.twitch.tv/favicon.ico"
+            },
         }
-        
+
         payload = {
             "embeds": [embed]
         }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(DISCORD_WEBHOOK_URL, json=payload) as response:
-                if response.status == 204:
-                    print("✅ Clip enviado a Discord exitosamente", flush=True)
-                else:
-                    error_text = await response.text()
-                    print(f"❌ Error al enviar a Discord: {response.status} - {error_text}", flush=True)
-    except Exception as e:
-        print(f"❌ Error al enviar clip a Discord: {e}", flush=True)
 
-async def get_clip_details(clip_id):
-    """Obtiene información detallada del clip desde la API de Twitch"""
-    try:
-        url = f"https://api.twitch.tv/helix/clips?id={clip_id}"
-        
-        oauth_token = TOKEN.replace('oauth:', '') if TOKEN else None
-        headers = {
-            'Authorization': f'Bearer {oauth_token}',
-            'Client-Id': CLIENT_ID
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get('data') and len(data['data']) > 0:
-                        return data['data'][0]
-                    else:
-                        print("❌ No se encontraron detalles del clip", flush=True)
-                        return None
-                else:
-                    error_text = await response.text()
-                    print(f"❌ Error al obtener detalles del clip: {response.status} - {error_text}", flush=True)
-                    return None
-                    
-    except Exception as e:
-        print(f"❌ Error al obtener detalles del clip: {e}", flush=True)
-        return None
+        try:
+            response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+            response.raise_for_status()
+            logging.info(f"Notificación de clip enviada a Discord para {clip_id}")
+        except requests.exceptions.Timeout:
+            logging.error("La solicitud al webhook de Discord excedió el tiempo de espera.")
+        except requests.exceptions.HTTPError as e:
+            logging.error(f"Error HTTP al enviar notificación a Discord: {e.response.status_code} - {e.response.text}")
+        except Exception as e:
+            logging.error(f"Error inesperado al enviar notificación a Discord: {e}")
 
-def extract_username_from_message(message):
-    """Extrae el nombre de usuario del mensaje de Twitch IRC"""
-    try:
-        # Formato: :username!username@username.tmi.twitch.tv PRIVMSG #channel :!clip
-        if ':' in message and '!' in message:
-            username = message.split(':')[1].split('!')[0]
-            return username
-        return None
-    except:
-        return None
-
-async def create_clip(creator_username=None, clip_name=None):
-    try:
-        # Prepare the API request
-        url = f"https://api.twitch.tv/helix/clips?broadcaster_id={BROADCASTER_ID}&duration=60"
-        
-        # Remove 'oauth:' prefix if present
-        oauth_token = TOKEN.replace('oauth:', '') if TOKEN else None
-        
-        if not oauth_token:
-            raise Exception("No se encontró TWITCH_OAUTH_TOKEN en el archivo .env")
-        
-        headers = {
-            'Authorization': f'Bearer {oauth_token}',
-            'Client-Id': CLIENT_ID
-        }
-        
-        print(f"🎬 Creando clip para {CHANNEL} con duración de 60 segundos...", flush=True)
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers) as response:
-                if response.status == 202:  # Twitch returns 202 for successful clip creation
-                    data = await response.json()                      
-                    if data.get('data') and len(data['data']) > 0:
-                        clip_id = data['data'][0]['id']
-                        # Return URL without /edit
-                        clip_url = f"https://clips.twitch.tv/{clip_id}"
-                        print(f"✅ Clip creado: {clip_url}", flush=True)
-                        
-                        # Obtener detalles adicionales del clip
-                        print("📋 Obteniendo detalles del clip...", flush=True)
-                        clip_details = await get_clip_details(clip_id)
-                        
-                        # Agregar el nombre del creador desde el chat si está disponible
-                        if creator_username and clip_details:
-                            clip_details['creator_name'] = creator_username
-                        elif creator_username:
-                            # Si no hay clip_details, crear un diccionario básico
-                            clip_details = {'creator_name': creator_username}
-                        if clip_name:
-                            clip_details['title'] = clip_name
-                        # Enviar clip a Discord con información detallada
-                        await send_clip_to_discord(clip_url, CHANNEL, clip_details)
-                        
-                        return clip_url
-                    else:
-                        raise Exception("No se recibieron datos del clip")
-                else:
-                    error_text = await response.text()
-                    raise Exception(f"Error en la API: {response.status} - {error_text}")
-                    
-    except Exception as e:
-        raise e
-
-async def bot_loop():
-    sock = socket.socket()
-    sock.connect((HOST, PORT))
-    sock.send(f"PASS {TOKEN}\r\n".encode('utf-8'))
-    sock.send(f"NICK {CHANNEL}\r\n".encode('utf-8'))
-    sock.send(f"JOIN #{CHANNEL}\r\n".encode('utf-8'))
-
-    while True:
-        resp = sock.recv(2048).decode('utf-8')
-
-        if resp.startswith('PING'):
-            sock.send("PONG :tmi.twitch.tv\r\n".encode('utf-8'))        
-        elif '!clip' in resp:
-            print("Comando !clip recibido", flush=True)
-            clip_name = resp.split('!clip')[1].strip()
-            # Extraer el nombre de usuario que ejecutó el comando
-            creator_username = extract_username_from_message(resp)
-            if creator_username:
-                print(f"👤 Comando ejecutado por: {creator_username}", flush=True)
-            
+    def send_message(self, message: str):
+        if self.connected and self.sock:
             try:
-                clip_url = await create_clip(creator_username, clip_name)
-                if not clip_name:
-                    clip_name = "Clip creado"
-                send_message(sock, f"📸 {clip_name}: {clip_url}")
+                self.sock.send(f"PRIVMSG {self.channel} :{message}\r\n".encode('utf-8'))
+                logging.info(f"Mensaje enviado: {message}")
+            except socket.error as e:
+                logging.error(f"Error al enviar mensaje, la conexión puede haberse perdido: {e}")
+                self.connected = False
             except Exception as e:
-                print(f"Error al crear clip: {e}", flush=True)
-                send_message(sock, "❌ Error al crear el clip. Inténtalo más tarde.")
+                logging.error(f"Error inesperado al enviar mensaje: {e}")
+        else:
+            logging.warning(f"No conectado a IRC, no se pudo enviar el mensaje: {message}")
+
+    def _get_user_avatar(self, username: str) -> str:
+        """Obtiene el avatar del usuario de Twitch"""
+        headers = {
+            'Client-ID': CLIENT_ID,
+            'Authorization': f'Bearer {ACCESS_TOKEN}',
+        }
+        try:
+            user_res = requests.get(f'https://api.twitch.tv/helix/users?login={username}', headers=headers, timeout=5)
+            user_res.raise_for_status()
+            user_data = user_res.json().get('data')
+            
+            if user_data and len(user_data) > 0:
+                avatar_url = user_data[0].get('profile_image_url', '')
+                if avatar_url:
+                    logging.info(f"Avatar obtenido para {username}: {avatar_url}")
+                    return avatar_url
+            
+            logging.warning(f"No se pudo obtener el avatar para {username}")
+            return "https://static-cdn.jtvnw.net/jtv_user_pictures/8a6381c7-d0c0-4576-b179-38bd5ce1d6af-profile_image-300x300.png"
+            
+        except Exception as e:
+            logging.error(f"Error al obtener avatar del usuario {username}: {e}")
+            # Retornar imagen por defecto de Twitch
+            return "https://static-cdn.jtvnw.net/jtv_user_pictures/8a6381c7-d0c0-4576-b179-38bd5ce1d6af-profile_image-300x300.png"
 
 if __name__ == '__main__':
-    asyncio.run(bot_loop())
+    bot = TwitchBot()
+    bot.connect()
+    bot.listen()
