@@ -74,7 +74,6 @@ class TwitchBot:
                     user_info, message_content = resp.split('PRIVMSG', 1)[1].split(':', 1)
                     user = resp.split('!', 1)[0][1:].strip()
                     message = message_content.strip()
-                    logging.info(f"{user}: {message}")
 
                     if message.lower().startswith('!clip'):
                         self._handle_clip_command(user, message) # Pasamos el mensaje completo
@@ -140,12 +139,14 @@ class TwitchBot:
             'Authorization': f'Bearer {ACCESS_TOKEN}',
         }
         try:
-            user_info_res = requests.get('https://api.twitch.tv/helix/users', headers=headers, timeout=5)
+            # Obtener información del canal donde se ejecuta el bot (no del bot mismo)
+            channel_name = os.getenv('CHANNEL_NAME')
+            user_info_res = requests.get(f'https://api.twitch.tv/helix/users?login={channel_name}', headers=headers, timeout=5)
             user_info_res.raise_for_status()
             user_data = user_info_res.json().get('data')
 
             if not user_data:
-                logging.error(f"La información del usuario no está presente en la respuesta de la API. Respuesta: {user_info_res.json()}")
+                logging.error(f"La información del canal '{channel_name}' no está presente en la respuesta de la API. Respuesta: {user_info_res.json()}")
                 return None
 
             broadcaster_id = user_data[0]['id']
